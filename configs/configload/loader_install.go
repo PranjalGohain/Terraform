@@ -10,6 +10,7 @@ import (
 	version "github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl2/hcl"
 	"github.com/hashicorp/terraform/configs"
+	"github.com/hashicorp/terraform/registry"
 	"github.com/hashicorp/terraform/registry/regsrc"
 )
 
@@ -154,8 +155,9 @@ func (l *Loader) InstallModules(rootDir string, upgrade bool, hooks InstallHooks
 				}
 				log.Printf("[TRACE] %s is a registry module at %s", key, addr)
 
-				// TODO: Implement
-				panic("registry source installation not yet implemented")
+				mod, v, mDiags := l.installRegistryModule(req, key, instPath, addr, hooks)
+				diags = append(diags, mDiags...)
+				return mod, v, diags
 
 			default:
 				log.Printf("[TRACE] %s address %q will be interpreted with go-getter", key, req.SourceAddr)
@@ -230,6 +232,146 @@ func (l *Loader) installLocalModule(req *configs.ModuleRequest, key string, hook
 	hooks.Install(key, nil, newDir)
 
 	return mod, diags
+}
+
+func (l *Loader) installRegistryModule(req *configs.ModuleRequest, key string, instPath string, addr *regsrc.Module, hooks InstallHooks) (*configs.Module, *version.Version, hcl.Diagnostics) {
+	var diags hcl.Diagnostics
+
+	hostname, err := addr.SvcHost()
+	if err != nil {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid module registry hostname",
+			Detail:   "The hostname portion of this source address is not a valid hostname.",
+			Subject:  &req.SourceAddrRange,
+		})
+		return nil, nil, diags
+	}
+
+	reg := l.modules.Registry
+
+	log.Printf("[DEBUG] %s listing available versions of %s at %s", key, addr, hostname)
+	resp, err := reg.Versions(addr)
+	if err != nil {
+		if registry.IsModuleNotFound(err) {
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Module not found",
+				Detail:   fmt.Sprintf("The specified module could not be found in the module registry at %s.", hostname),
+				Subject:  &req.SourceAddrRange,
+			})
+		} else {
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Error accessing remote module registry",
+				Detail:   fmt.Sprintf("Failed to retrieve available versions for this module from %s: %s.", hostname, err),
+				Subject:  &req.SourceAddrRange,
+			})
+		}
+		return nil, nil, diags
+	}
+
+	// The response might contain information about dependencies to allow us
+	// to potentially optimize future requests, but we don't currently do that
+	// and so for now we'll just take the first item which is guaranteed to
+	// be the address we requested.
+	if len(resp.Modules) < 1 {
+		// Should never happen, but since this is a remote service that may
+		// be implemented by third-parties we will handle it gracefully.
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid response from remote module registry",
+			Detail:   fmt.Sprintf("The registry at %s returned an invalid response when Terraform requested available versions for this module.", hostname),
+			Subject:  &req.SourceAddrRange,
+		})
+		return nil, nil, diags
+	}
+
+	modMeta := resp.Modules[0]
+
+	var latestMatch *version.Version
+	var latestVersion *version.Version
+	for _, mv := range modMeta.Versions {
+		v, err := version.NewVersion(mv.Version)
+		if err != nil {
+			// Should never happen if the registry server is compliant with
+			// the protocol, but we'll warn if not to assist someone who
+			// might be developing a module registry server.
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagWarning,
+				Summary:  "Invalid response from remote module registry",
+				Detail:   fmt.Sprintf("The registry at %s returned an invalid version string %q for this module, which Terraform ignored.", hostname, mv.Version),
+				Subject:  &req.SourceAddrRange,
+			})
+			continue
+		}
+
+		// If we've found a pre-release version then we'll ignore it unless
+		// it was exactly requested.
+		if v.Prerelease() != "" && req.VersionConstraint.Required.String() != v.String() {
+			log.Printf("[TRACE] %s ignoring %s because it is a pre-release and was not requested exactly", key, v)
+			continue
+		}
+
+		if latestVersion == nil || v.GreaterThan(latestVersion) {
+			latestVersion = v
+		}
+
+		if req.VersionConstraint.Required.Check(v) {
+			if latestMatch == nil || v.GreaterThan(latestMatch) {
+				latestMatch = v
+			}
+		}
+	}
+
+	if latestVersion == nil {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Module has no versions",
+			Detail:   fmt.Sprintf("The specified module does not have any available versions."),
+			Subject:  &req.SourceAddrRange,
+		})
+		return nil, nil, diags
+	}
+
+	if latestMatch == nil {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Unresolvable module version constraint",
+			Detail:   fmt.Sprintf("There is no available version of %q that matches the given version constraint. The newest available version is %s.", addr, latestVersion),
+			Subject:  &req.VersionConstraint.DeclRange,
+		})
+		return nil, nil, diags
+	}
+
+	// If we manage to get down here then we've found a suitable version to
+	// install, so we need to ask the registry where we should download it from.
+	// The response to this is a go-getter-style address string.
+	dlAddr, err := reg.Location(addr, latestMatch.String())
+	if err != nil {
+		log.Printf("[ERROR] %s from %s %s: %s", key, addr, latestMatch, err)
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid response from remote module registry",
+			Detail:   fmt.Sprintf("The remote registry at %s failed to return a download URL for %s %s.", hostname, addr, latestMatch),
+			Subject:  &req.VersionConstraint.DeclRange,
+		})
+		return nil, nil, diags
+	}
+
+	log.Printf("[DEBUG] %s %s %s is available at %q", key, addr, latestMatch, dlAddr)
+
+	// The module registry creates an extra level of indirection here where
+	// both the address given by the user and the location address given by
+	// the registry can contain sub-directory strings. Once we've extracted
+	// the source package we will need to resolve the user's given subdir
+	// relative to the registry's given subdir in order to find the desired
+	// directory.
+	//_, moduleSubDir := splitAddrSubdir(req.SourceAddr)
+	//sourceAddr, packageSubDir := splitAddrSubdir(dlAddr)
+
+	// TODO: finish this
+	panic("installRegistryModule can't download things yet")
 }
 
 func (l *Loader) packageInstallPath(modulePath []string) string {
